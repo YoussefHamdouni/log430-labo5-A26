@@ -4,6 +4,7 @@ SPDX - License - Identifier: LGPL - 3.0 - or -later
 Auteurs : Gabriel C. Ullmann, Fabio Petrillo, 2025
 """
 import threading
+import time
 from graphene import Schema
 from stocks.schemas.query import Query
 from flask import Flask, request, jsonify
@@ -123,6 +124,13 @@ def graphql_supplier():
 def put_orders():
     """Update one or more order fields"""
     return update_order(request)
+
+# Test du timeout de KrakenD (activité 6)
+@app.get('/test/slow/<int:delay_seconds>')
+def test_slow_endpoint(delay_seconds):
+    """Endpoint pour tester les timeouts"""
+    time.sleep(delay_seconds)  # Simule une opération lente
+    return {"message": f"Response after {delay_seconds} seconds"}, 200
 
 @app.route("/metrics")
 def metrics():
