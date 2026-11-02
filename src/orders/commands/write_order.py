@@ -105,24 +105,33 @@ def modify_order(order_id: int, is_paid: bool):
         session.close()
 
 def request_payment_link(order_id, total_amount, user_id):
-    payment_id = 0
+    payment_id = None
     payment_transaction = {
         "user_id": user_id,
         "order_id": order_id,
         "total_amount": total_amount
     }
 
-    response_from_payment_service = requests.post(
-        "http://api-gateway:8080/payments-api/payments",
-        json=payment_transaction,
-        headers={'Content-Type': 'application/json'}
-    )
+    # Timeout : un service de paiement lent ou absent ne doit pas bloquer la création de la commande
+    try:
+        response_from_payment_service = requests.post(
+            "http://api-gateway:8080/payments-api/payments",
+            json=payment_transaction,
+            headers={'Content-Type': 'application/json'},
+            timeout=5
+        )
+        if response_from_payment_service.ok:
+            payment_id = response_from_payment_service.json().get("payment_id")
+    except requests.RequestException as e:
+        logger.error(f"Service de paiement injoignable pour la commande {order_id} : {e}")
 
-    if response_from_payment_service.ok:
-        payment_id = response_from_payment_service.json()["payment_id"]
-        print(f"ID paiement: {payment_id}")
+    # Pas de lien vers .../process/0 : la commande reste sans lien de paiement
+    if payment_id is None:
+        logger.error(f"Aucun lien de paiement créé pour la commande {order_id}")
+        return None
 
-    return f"http://api-gateway:8080/payments-api/payments/process/{payment_id}" 
+    print(f"ID paiement: {payment_id}")
+    return f"http://api-gateway:8080/payments-api/payments/process/{payment_id}"
 
 def delete_order(order_id: int):
     """Delete order in MySQL, keep Redis in sync"""
@@ -159,7 +168,7 @@ def add_order_to_redis(order_id, user_id, total_amount, items, payment_link):
             "user_id": user_id,
             "total_amount": float(total_amount),
             "items": json.dumps(items),
-            "payment_link": payment_link
+            "payment_link": payment_link or ""  # Redis refuse None
         }
     )
 
