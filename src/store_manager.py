@@ -4,26 +4,49 @@ SPDX - License - Identifier: LGPL - 3.0 - or -later
 Auteurs : Gabriel C. Ullmann, Fabio Petrillo, 2025
 """
 import threading
-import time
 from graphene import Schema
 from stocks.schemas.query import Query
 from flask import Flask, request, jsonify
 from orders.controllers.order_controller import create_order, remove_order, get_order, get_report_highest_spending_users, get_report_best_selling_products, update_order
 from orders.controllers.user_controller import create_user, remove_user, get_user
 from stocks.controllers.product_controller import create_product, remove_product, get_product
-from stocks.controllers.stock_controller import get_stock, populate_redis_on_startup, set_stock, get_stock_overview
-from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
+from stocks.controllers.stock_controller import get_stock, populate_redis_on_startup, set_stock, get_stock_overview, update_stock
  
+import os
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.instrumentation.flask import FlaskInstrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+
 app = Flask(__name__)
+
+# --- Distributed tracing (Jaeger via OpenTelemetry) ---
+resource = Resource.create({
+    "service.name": "store-manager",
+    "service.version": "1.0.0"
+})
+trace.set_tracer_provider(TracerProvider(resource=resource))
+tracer = trace.get_tracer(__name__)
+
+# Jaeger reçoit les traces en OTLP/gRPC sur le port 4317 (hostname "jaeger" dans Docker)
+otlp_exporter = OTLPSpanExporter(
+    endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://jaeger:4317"),
+    insecure=True
+)
+trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(otlp_exporter))
+
+# Instrumentation automatique : un span par requête Flask reçue,
+# et propagation du contexte (en-tête traceparent) dans chaque appel requests sortant
+FlaskInstrumentor().instrument_app(app)
+RequestsInstrumentor().instrument()
 
 # Auto-populate Redis 5s after API startup (to give enough time for the DB to start up as well)
 thread = threading.Timer(10.0, populate_redis_on_startup)
 thread.daemon = True
 thread.start()
-
-counter_orders = Counter('orders', 'Calls to orders')
-counter_highest_spenders = Counter('highest_spenders', 'Calls to highest spenders report')
-counter_best_sellers = Counter('best_sellers', 'Calls to best sellers report')
 
 @app.get('/health-check')
 def health():
@@ -34,13 +57,15 @@ def health():
 @app.post('/orders')
 def post_orders():
     """Create a new order based on information on request body"""
-    counter_orders.inc()
-    return create_order(request)
+    with tracer.start_as_current_span("create-order"):
+        return create_order(request)
 
 @app.delete('/orders/<int:order_id>')
 def delete_orders_id(order_id):
     """Delete an order with a given order_id"""
-    return remove_order(order_id)
+    with tracer.start_as_current_span("delete-order") as span:
+        span.set_attribute("order.id", order_id)
+        return remove_order(order_id)
 
 @app.post('/products')
 def post_products():
@@ -67,11 +92,19 @@ def post_stocks():
     """Set product stock based on information on request body"""
     return set_stock(request)
 
+@app.put('/stocks')
+def put_stocks():
+    """Check in/out product stock for given product_id and quantity"""
+    with tracer.start_as_current_span("update-stock"):
+        return update_stock(request)
+
 # Read routes (Queries) 
 @app.get('/orders/<int:order_id>')
 def get_order_id(order_id):
     """Get order with a given order_id"""
-    return get_order(order_id)
+    with tracer.start_as_current_span("get-order") as span:
+        span.set_attribute("order.id", order_id)
+        return get_order(order_id)
 
 @app.get('/products/<int:product_id>')
 def get_product_id(product_id):
@@ -91,14 +124,12 @@ def get_stocks(product_id):
 @app.get('/orders/reports/highest-spenders')
 def get_orders_highest_spending_users():
     """Get list of highest speding users, order by total expenditure"""
-    counter_highest_spenders.inc()
     rows = get_report_highest_spending_users()
     return jsonify(rows)
 
 @app.get('/orders/reports/best-sellers')
 def get_orders_report_best_selling_products():
     """Get list of best selling products, order by number of orders"""
-    counter_best_sellers.inc()
     rows = get_report_best_selling_products()
     return jsonify(rows)
 
@@ -123,18 +154,8 @@ def graphql_supplier():
 @app.put('/orders')
 def put_orders():
     """Update one or more order fields"""
-    return update_order(request)
-
-# Test du timeout de KrakenD (activité 6)
-@app.get('/test/slow/<int:delay_seconds>')
-def test_slow_endpoint(delay_seconds):
-    """Endpoint pour tester les timeouts"""
-    time.sleep(delay_seconds)  # Simule une opération lente
-    return {"message": f"Response after {delay_seconds} seconds"}, 200
-
-@app.route("/metrics")
-def metrics():
-    return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}
+    with tracer.start_as_current_span("update-order"):
+        return update_order(request)
 
 # Start Flask app
 if __name__ == '__main__':
