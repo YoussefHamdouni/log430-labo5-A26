@@ -12,16 +12,36 @@ from orders.controllers.user_controller import create_user, remove_user, get_use
 from stocks.controllers.product_controller import create_product, remove_product, get_product
 from stocks.controllers.stock_controller import get_stock, populate_redis_on_startup, set_stock, get_stock_overview, update_stock
  
-# TODO: utilisez pour la config à Jaeger
-# from opentelemetry import trace
-# from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-# from opentelemetry.sdk.resources import Resource
-# from opentelemetry.sdk.trace import TracerProvider
-# from opentelemetry.sdk.trace.export import BatchSpanProcessor
-# from opentelemetry.instrumentation.flask import FlaskInstrumentor
-# from opentelemetry.instrumentation.requests import RequestsInstrumentor
+import os
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.instrumentation.flask import FlaskInstrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
 
 app = Flask(__name__)
+
+# --- Distributed tracing (Jaeger via OpenTelemetry) ---
+resource = Resource.create({
+    "service.name": "store-manager",
+    "service.version": "1.0.0"
+})
+trace.set_tracer_provider(TracerProvider(resource=resource))
+tracer = trace.get_tracer(__name__)
+
+# Jaeger reçoit les traces en OTLP/gRPC sur le port 4317 (hostname "jaeger" dans Docker)
+otlp_exporter = OTLPSpanExporter(
+    endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://jaeger:4317"),
+    insecure=True
+)
+trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(otlp_exporter))
+
+# Instrumentation automatique : un span par requête Flask reçue,
+# et propagation du contexte (en-tête traceparent) dans chaque appel requests sortant
+FlaskInstrumentor().instrument_app(app)
+RequestsInstrumentor().instrument()
 
 # Auto-populate Redis 5s after API startup (to give enough time for the DB to start up as well)
 thread = threading.Timer(10.0, populate_redis_on_startup)
@@ -37,12 +57,15 @@ def health():
 @app.post('/orders')
 def post_orders():
     """Create a new order based on information on request body"""
-    return create_order(request)
+    with tracer.start_as_current_span("create-order"):
+        return create_order(request)
 
 @app.delete('/orders/<int:order_id>')
 def delete_orders_id(order_id):
     """Delete an order with a given order_id"""
-    return remove_order(order_id)
+    with tracer.start_as_current_span("delete-order") as span:
+        span.set_attribute("order.id", order_id)
+        return remove_order(order_id)
 
 @app.post('/products')
 def post_products():
@@ -72,13 +95,16 @@ def post_stocks():
 @app.put('/stocks')
 def put_stocks():
     """Check in/out product stock for given product_id and quantity"""
-    return update_stock(request)
+    with tracer.start_as_current_span("update-stock"):
+        return update_stock(request)
 
 # Read routes (Queries) 
 @app.get('/orders/<int:order_id>')
 def get_order_id(order_id):
     """Get order with a given order_id"""
-    return get_order(order_id)
+    with tracer.start_as_current_span("get-order") as span:
+        span.set_attribute("order.id", order_id)
+        return get_order(order_id)
 
 @app.get('/products/<int:product_id>')
 def get_product_id(product_id):
@@ -128,7 +154,8 @@ def graphql_supplier():
 @app.put('/orders')
 def put_orders():
     """Update one or more order fields"""
-    return update_order(request)
+    with tracer.start_as_current_span("update-order"):
+        return update_order(request)
 
 # Start Flask app
 if __name__ == '__main__':
