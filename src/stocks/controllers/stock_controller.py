@@ -25,12 +25,18 @@ def update_stock(request):
     payload = request.get_json() or {}
     items = payload.get('items')
     operation = payload.get('operation')
+    session = get_sqlalchemy_session()
     try:
-        session = get_sqlalchemy_session()
         update_stock_mysql(session, items, operation)
+        # Sans commit, l'UPDATE est annulé à la fermeture de la session :
+        # l'API répondait OK mais le stock ne changeait pas dans MySQL
+        session.commit()
         return jsonify({'result': 'OK'}), 201
-    except Exception as e:  
+    except Exception as e:
+        session.rollback()
         return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
 
 def get_stock(product_id):
     """Get stock quantities of a product"""
